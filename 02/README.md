@@ -31,11 +31,18 @@ The problem is insertion and deletion. To insert into the middle, later entries 
 deleting an entry also leaves a gap to close. Either update can take `O(N)` work. Sorted arrays
 are excellent for searching static data, but expensive when the data changes often.
 
+There are two useful ways to make an ordered array more update-friendly. One is to split it
+into smaller sorted arrays and organize those arrays in levels; this is the basic idea behind
+a B+ tree. Another is to collect updates in a small sorted structure and merge them into
+larger sorted data later; this is the basic idea behind an LSM tree.
+
 ## B+ trees: keep the index ordered while allowing updates
 
 A B+ tree breaks the sorted data into small, sorted nodes arranged as a balanced multiway
 tree. Internal nodes hold separator keys and child pointers; leaf nodes hold the actual keys
 and values. Since each internal node can point to many children, the tree stays shallow.
+Each node is like a small sorted array. The upper levels guide the search to the right leaf,
+and splits keep those arrays within their size limit as keys are inserted.
 
 ```text
                  [ 30 | 60 ]       internal node
@@ -66,6 +73,14 @@ from storage uses several I/O operations. If the device has a limited IOPS rate,
 limit how many lookups it can serve at once. The time for each read also affects how long one
 lookup takes.
 
+Storage and software use different block sizes. Older hard drives commonly transferred data
+in 512-byte sectors. The operating system also caches file data in memory pages, commonly
+4 KiB, though the exact sizes depend on the hardware and OS. A database can choose its own
+logical **page** size for reading and writing its file. A B+ tree node is stored in one or
+more of these database pages. Keeping nodes aligned to the I/O unit avoids reading a block
+while using only a small fraction of it. The database page does not have to be the same size
+as an OS memory page or a physical disk sector.
+
 ### Why a wide tree needs fewer reads
 
 Imagine a balanced binary search tree with one key and two child choices per node. With one
@@ -90,29 +105,51 @@ levels require no disk access. The tree is still designed to keep its height low
 lookups that do need storage. Larger nodes can hold more branches, but they also take longer
 to search and update, so node size is a trade-off.
 
+Wide nodes also reduce pointer overhead. In a binary tree, each key is usually in its own
+node with child pointers. In a B+ tree, many keys in a leaf share the same pointer from their
+parent. Keys can be packed tightly, and similar keys can sometimes be compressed. The result
+is less metadata per key and more useful data in each page.
+
 ## LSM trees: batch updates and merge sorted data
 
 An LSM tree takes a different approach. It accepts recent updates in a small, mutable index,
 then periodically merges those updates into larger, sorted files. Merging costs work, but it
-avoids rewriting the whole data set for every individual update.
+avoids rewriting the whole data set for every individual update. The update cost is spread
+across later merges; this is called **amortizing** the cost.
 
 ```text
 writes -> small recent index -> merge -> larger sorted levels
 ```
 
-Each level contains sorted data. Newer levels take priority because a key may have older
-versions in lower levels. A deletion is recorded as a **tombstone**, which tells lookups to
-hide an older value. During compaction, levels are merged, obsolete versions and tombstones
-can be removed, and their space reclaimed.
+Each level contains sorted data. When a small level fills, it is merged into a larger one.
+If every flush rewrites one enormous data file, the amount written can greatly exceed the
+amount of new data; this is **write amplification**. Multiple levels limit that repeated
+rewriting. For example, levels can grow geometrically (roughly 1x, 2x, 4x, 8x ...), so new
+data is merged into a similarly sized level before that level is eventually merged upward.
+The trade-off is that more levels can mean more places to check during reads. Fewer levels
+can mean larger merges and more write amplification.
 
-LSM trees trade write cost for read work: a lookup may need to check several levels. A Bloom
-filter can quickly say that a level definitely does not contain a key, avoiding some reads.
-Range queries combine the ordered results from the levels. Implementations often split levels
-into smaller sorted files so that compaction can proceed gradually.
+Newer levels take priority because a key may have older versions in lower levels. A deletion
+is recorded as a **tombstone**, which tells lookups to hide an older value. During
+**compaction**, levels are merged, obsolete versions and tombstones can be removed, and their
+space reclaimed.
 
-The small in-memory index for recent writes is often called a **MemTable**. Sorted files on
-disk are commonly called **SSTables**. The MemTable can be a B+ tree, skip list, or another
-ordered structure; a write-ahead log can help recover its recent updates after a crash.
+LSM trees trade write cost for read work: a point lookup may need to check levels, usually
+newest first. A **Bloom filter** can say that a level definitely does not contain a key,
+avoiding a read of that level; a positive result only means the key might be there, so the
+database still checks. A range query performs a **k-way merge** of sorted results from the
+levels, choosing the newest version when the same key appears more than once.
+
+Large levels are often split into multiple sorted files called **SSTables**. This lets
+compaction work on pieces over time instead of needing enough free space and time to rewrite
+an entire level in one operation. Files within a level can be organized so their key ranges
+do not overlap, which helps the database decide which files to inspect.
+
+The small in-memory index for recent writes is called a **MemTable**. It keeps recent values
+fast to read while the on-disk levels are being merged. A **write-ahead log (WAL)** records
+those updates so the MemTable can be rebuilt after a crash. The WAL and MemTable both contain
+recent updates for different purposes: the WAL provides recovery, while the MemTable provides
+an index for reads. The MemTable can use a B+ tree, skip list, or another ordered structure.
 
 ## Choosing between them
 
