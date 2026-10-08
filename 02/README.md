@@ -55,31 +55,79 @@ leaf. To find a range, seek to its first key and continue through the leaves in 
 Updates change only a small number of nodes; when a node fills, it splits and the tree may
 gain a new root.
 
-### HDDs, SSDs, and I/O operations
+### Where HDDs and SSDs fit
 
-An **HDD** stores data on spinning magnetic disks. To read a location, it moves a mechanical
-head to the right track and waits for the disk to rotate to the data. That makes a random read
-costly: the next requested key may be far away from the previous one. Reading nearby data in
-sequence is much more efficient.
+An **HDD** or **SSD** is persistent storage: it keeps files when the power is off. Both are
+below RAM in the computer's storage hierarchy. The operating system and filesystem sit
+between an application and the drive:
 
-An **SSD** stores data in flash memory and has no moving head or spinning disk. It can handle
-random reads much faster than an HDD, but a read still takes time and the device still moves
-data in blocks. So reducing the number of reads helps on both kinds of storage, especially
-when many queries are competing to use the device.
+```text
+Database or application
+        │ asks to read file bytes
+        ▼
+Operating system + filesystem
+        │ checks the page cache in RAM
+        ├── cache hit ───────────────► return cached data
+        │
+        └── cache miss ─► storage driver/controller ─► HDD or SSD
+                                  read data into RAM ◄─────────┘
 
-An **I/O operation** is a request to read or write a block of data. **IOPS** means how many
-such requests a device can complete per second. A database lookup that needs several blocks
-from storage uses several I/O operations. If the device has a limited IOPS rate, those reads
-limit how many lookups it can serve at once. The time for each read also affects how long one
-lookup takes.
+CPU registers and caches ◄──► RAM (including the OS page cache)
+```
 
-Storage and software use different block sizes. Older hard drives commonly transferred data
-in 512-byte sectors. The operating system also caches file data in memory pages, commonly
-4 KiB, though the exact sizes depend on the hardware and OS. A database can choose its own
-logical **page** size for reading and writing its file. A B+ tree node is stored in one or
-more of these database pages. Keeping nodes aligned to the I/O unit avoids reading a block
-while using only a small fraction of it. The database page does not have to be the same size
-as an OS memory page or a physical disk sector.
+The application can ask for a particular byte offset in a file. The filesystem maps that
+file offset to locations on the drive. A **logical sector** or **device block** is the unit
+the drive exposes for addressing; 512-byte sectors were common on older HDDs. The underlying
+physical sector can be larger, such as 4 KiB, and need not match the logical size. The
+operating system hides these details from ordinary file reads.
+
+The **page cache** is in RAM, not on the drive. With normal buffered file I/O, the operating
+system can keep recently read file data in this cache and buffer writes there before sending
+them to storage. If the requested data is already cached, a read needs no drive access. If it
+isn't, the OS requests the necessary blocks and keeps the returned data in RAM for later use.
+The OS page size is commonly 4 KiB, but can vary by system.
+
+An **SSD** stores data in flash memory chips. It has no moving parts, so it can handle random
+reads much faster than an **HDD**, which stores data magnetically on spinning platters and
+must move a read head to the requested location. Sequential HDD reads are faster because
+nearby data can be read without repeatedly seeking to a new location. Both are still much
+slower than RAM, and both transfer data in blocks. An **I/O operation** is a request to read
+or write such data; **IOPS** means how many I/O operations a device can complete per second.
+Random reads are especially costly for an HDD, but reducing unnecessary reads helps SSDs too.
+
+### Four different meanings of “page” or “block”
+
+These units are related, but they are not the same thing:
+
+| Unit | Layer | What it describes |
+|---|---|---|
+| Sector/device block | Drive | The block addressed by the storage device, such as a 512-byte or 4 KiB sector. |
+| OS memory page | Operating system and RAM | The chunk used for virtual memory and commonly for file caching; often 4 KiB. |
+| Database page | Database | The chunk the database chooses to read, write, and organize on disk. |
+| Cache line | CPU cache | The small chunk fetched from RAM into CPU cache; commonly 64 bytes. |
+
+A database page can be larger than an OS page and may cover multiple OS pages or device
+blocks. The sizes do not have to match. The CPU cache line is smaller still: when the CPU
+uses one byte from RAM, the hardware typically fetches the cache line containing it. Cache
+line size is hardware-dependent.
+
+Databases commonly choose a page size that is one or more convenient I/O units, then pack
+tree nodes to make good use of those pages. The operating system can split, combine, or cache
+requests, so this is a design alignment rather than a guarantee that one database page always
+becomes exactly one physical device operation.
+
+### Why database pages should hold useful tree nodes
+
+Imagine a database asks for one key in a node that is only 256 bytes. If the OS or device has
+to fetch a 4 KiB page/block to get that node, most of that transfer is not needed for this
+lookup. The other bytes are not permanently wasted—they may contain a neighboring node that
+a later lookup can reuse—but the current lookup used only a small part of what was fetched.
+
+If a B+ tree node is sized to use a database page well, one page read can bring in many
+separator keys and child pointers at once. That is the connection between page size and
+**fanout**: a node that fits more child pointers can direct a search into more ranges. The
+variable `n` in `log_n(N)` is this approximate number of branches per level. More branches
+mean fewer levels, and fewer uncached levels usually mean fewer storage reads.
 
 ### Why a wide tree needs fewer reads
 
@@ -109,6 +157,12 @@ Wide nodes also reduce pointer overhead. In a binary tree, each key is usually i
 node with child pointers. In a B+ tree, many keys in a leaf share the same pointer from their
 parent. Keys can be packed tightly, and similar keys can sometimes be compressed. The result
 is less metadata per key and more useful data in each page.
+
+A B+ tree can also live entirely in RAM. The same compact layout can help, but the unit moving
+between RAM and the CPU cache is a much smaller cache line (commonly 64 bytes), rather than a
+kilobyte-sized database page. The on-disk benefit from avoiding slow storage reads is
+therefore more dramatic; in memory, cache locality and the cost of searching each node matter
+more.
 
 ## LSM trees: batch updates and merge sorted data
 
