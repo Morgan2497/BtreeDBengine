@@ -524,6 +524,34 @@ buffer is no longer needed. The database must track its own disk-page ownership 
 It still uses ordinary RAM allocation for buffers; the extra responsibility is allocation
 inside the persistent file.
 
+Think of these as two separate pools:
+
+```text
+RAM: Go allocator and garbage collector       database.db: database page allocator
+
+Go buffer contains a copy of page P3          file slot P3 contains a tree node
+          │                                               │
+          │ buffer becomes unreachable                    │ DB proves no live root needs P3
+          ▼                                               ▼
+   RAM can be reused                               P3 enters the free list
+                                                           │
+                                                           │ later allocation
+                                                           ▼
+                                                  P3 can hold a new node
+```
+
+For example, suppose the current root `R1` points to page `P3`. A copy-on-write update
+creates a new root `R2` and writes the changed node to `P8`; `R1` and its `P3` remain
+available to a reader that started before the update. Go may collect the temporary byte
+slice used to read `P3`, but that only releases the RAM buffer. The bytes in the database
+file remain, and `P3` cannot be reused while any active root or recovery state may still
+need it. After the database establishes that no such version needs `P3`, its page allocator
+can put `P3` on the free list. A later allocation can reuse that file slot for another node.
+
+So `free` has two different meanings here: freeing a Go buffer returns RAM to Go's memory
+manager; freeing a database page records that a persistent file slot is safe for the database
+to reuse. The first does not perform the second.
+
 ### 4.2 Fixed-size block allocation
 
 Suppose a database page is 4,096 bytes. Divide the file into equal slots:
